@@ -34,7 +34,8 @@ Make sure **ffmpeg** and **yt-dlp** are installed. Use `brew`, `apt` or `winget`
 
 ## Usage
 
-Run the script with the desired options:
+Run the script with NPO Start 'afspelen' link:
 ```bash
 python npo-dl.py <npo_url>
+# e.g.:
 ```

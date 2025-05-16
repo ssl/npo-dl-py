@@ -104,9 +104,84 @@ def get_stream_info(jwt: str, session: requests.Session) -> dict:
 
     resp = session.post(url, headers=headers, json=payload)
     if resp.status_code != 200:
-        raise ValueError(f"Failed to get stream info (status={resp.status_code}).")
+        if resp.status_code == 402:
+            raise ValueError(f"Failed to download 'Plus' content (do you have a NPO Plus subscription?).")
+        else:
+            raise ValueError(f"Failed to get stream info (status={resp.status_code}).")
 
     return resp.json()
+
+
+def npo_login(session: requests.Session) -> requests.Session:
+    """
+    Logs in to NPO using the provided session.
+    """
+    url = "https://id.npo.nl/account/login"
+    resp = session.get(url)
+
+    if resp.status_code != 200:
+        raise ValueError(f"Failed to get login page (status={resp.status_code}).")
+
+    # Get __RequestVerificationToken input value
+    soup = BeautifulSoup(resp.text, "html.parser")
+    token_input = soup.find("input", {"name": "__RequestVerificationToken"})
+    if not token_input:
+        raise ValueError("Could not find __RequestVerificationToken input.")
+
+    token = token_input.get("value")
+
+    # Send login request
+    login = session.post(url, data={
+        "__RequestVerificationToken": token,
+        "EmailAddress": os.getenv("NPO_MAIL"),
+        "Password": os.getenv("NPO_PASS"),
+    })
+
+    if login.status_code == 200:
+        if 'profiel.npo.nl/callback' not in login.text:
+            raise ValueError(f"Login failed. Please check your credentials.")
+        else:
+            soup = BeautifulSoup(login.text, "html.parser")
+            code_input = soup.find("input", {"name": "code"})
+            scope_input = soup.find("input", {"name": "scope"})
+            state_input = soup.find("input", {"name": "state"})
+            session_state_input = soup.find("input", {"name": "session_state"})
+            iss_input = soup.find("input", {"name": "iss"})
+
+            # Send callback request
+            session.post('https://profiel.npo.nl/callback', data={
+                "code": code_input.get("value"),
+                "scope": scope_input.get("value"),
+                "state": state_input.get("value"),
+                "session_state": session_state_input.get("value"),
+                "iss": iss_input.get("value")
+            })
+    else:
+        raise ValueError(f"Incorrect status code: {login.status_code}")
+    
+    # Check if login was successful
+    profile = session.get('https://profiel.npo.nl/dashboard')
+    if os.getenv("NPO_MAIL") not in profile.text:
+        raise ValueError(f"Login failed. Please check your credentials.")
+
+    # Get CSRF token to signin the NPO ID in NPO Start
+    csrf = session.get('https://npo.nl/start/api/auth/csrf')
+    jsn = csrf.json()
+
+    # Signin the NPO ID in NPO Start
+    sign_npoid = session.post('https://npo.nl/start/api/auth/signin/npo-id', data={
+        'callbackUrl': 'https://npo.nl/start/',
+        'csrfToken': jsn["csrfToken"],
+        'json': 'true'
+    })
+    jsn = sign_npoid.json()
+
+    # Follow redirects to NPO Start for cookies
+    session.get(jsn["url"], allow_redirects=True)
+
+    print("Successfully logged in to NPO.")
+    return session
+
 
 def parse_pssh_from_mpd(mpd_xml: str) -> str:
     """
@@ -283,6 +358,11 @@ def get_npo_stream_info(npo_url: str) -> dict:
         # 2. Extract productId matching the slug
         product_id = get_product_id_from_html(resp.text, slug)
 
+        try:
+            s = npo_login(s)
+        except Exception as e:
+            print(f"Failed to login to NPO: {e}")
+        
         # 3. Get JWT
         jwt_token = get_player_token(product_id, s)
 
@@ -371,13 +451,14 @@ def decrypt_files(filename_format, key):
     combined_file = file_path.replace('.%(ext)s', '.mkv').replace('encrypted#', '')
     args = ['-i',mp4_file,'-i',m4a_file,'-c','copy',combined_file]
     if key:
+        key_part = key.split(':')[1]
         args = [
             '-decryption_key',
-            key.split(':')[1],
+            key_part,
             '-i',
             mp4_file,
             '-decryption_key',
-            key,
+            key_part,
             '-i',
             m4a_file,
             '-c',
