@@ -1,0 +1,5 @@
+.env
+npovideos/
+.idea/
+.vscode/
+.DS_Store
