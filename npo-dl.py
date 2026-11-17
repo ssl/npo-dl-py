@@ -1,513 +1,565 @@
 #!/usr/bin/env python3
-import sys
+"""Download episodes, seasons or whole series from NPO Start."""
+import argparse
+import base64
 import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-import base64
-import os
 from dotenv import load_dotenv
 
-# Try to load from .env
 load_dotenv()
-VWKEYS_API_KEY = os.getenv("VWKEYS_API_KEY", "NONE")
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "npovideos")
 
-def get_slug_from_url(npo_url: str) -> str:
-    """
-    Extracts the episode slug from the URL (e.g. "spoorloos_107").
-    Example path: /start/serie/spoorloos/seizoen-21/spoorloos_107/afspelen
-    """
-    print(npo_url)
-    parsed = urlparse(npo_url)
-    path = parsed.path
-    parts = path.split("/")
-    if len(parts) < 5:
-        raise ValueError("Invalid URL format.")
-    return parts[5]
+API_BASE = "https://npo.nl/start/api/domain"
+STREAM_LINK_URL = "https://prod.npoplayer.nl/stream-link"
+GETWVKEYS_URL = "https://getwvkeys.cc/pywidevine"
+# Used when the stream response does not name a license server itself.
+DEFAULT_LICENSE_URL = "https://drm.npoplayer.nl/proxyEngine.aspx"
+# Older stream responses carry a drmToken that goes to this gateway instead.
+LEGACY_LICENSE_URL = "https://npo-drm-gateway.samgcloud.nepworldwide.nl/authentication"
+WIDEVINE_SCHEME = "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0"
+)
+REQUEST_TIMEOUT = 30
+ENCRYPTED_PREFIX = "encrypted#"
 
-def get_product_id_from_html(html_content: str, target_slug: str) -> str:
-    """
-    Extract the correct productId by matching the 'slug' in the JSON (the __NEXT_DATA__).
-    If an episode has 'slug' == target_slug (e.g. 'spoorloos_107'),
-    return that episode's 'productId' (e.g. 'KN_1735212').
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
+VERBOSE = False
 
-    # Find the __NEXT_DATA__ script
-    next_data_script = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not next_data_script or not next_data_script.string:
-        raise ValueError("Could not find __NEXT_DATA__ script in HTML.")
 
-    data = json.loads(next_data_script.string)
+class NpoError(Exception):
+    """An expected failure with a message meant for the user."""
 
-    # The queries are typically under props -> pageProps -> dehydratedState -> queries
-    all_queries = data.get("props", {}) \
-                     .get("pageProps", {}) \
-                     .get("dehydratedState", {}) \
-                     .get("queries", [])
 
-    # We search all queries for 'state'->'data' which might be a list of episodes
-    for query in all_queries:
-        query_state = query.get("state", {})
-        episode_data = query_state.get("data", None)
+def debug(*args):
+    if VERBOSE:
+        print(*args)
 
-        # If data is a list, it may contain episodes
-        if isinstance(episode_data, list):
-            for item in episode_data:
-                if not isinstance(item, dict):
-                    continue
-                # Check if the slug matches
-                if item.get("slug") == target_slug and "productId" in item:
-                    return item["productId"]
 
-    raise ValueError(f"Could not find productId for slug '{target_slug}' in the HTML.")
+def env(name: str) -> str:
+    """Read an env var, treating the placeholders from .env.example as unset."""
+    value = (os.getenv(name) or "").strip()
+    return "" if value.lower() in ("none", "abc123") else value
 
-def get_player_token(product_id: str, session: requests.Session) -> str:
-    """
-    Calls /start/api/domain/player-token?productId=... to get the JWT token.
-    """
-    url = f"https://npo.nl/start/api/domain/player-token?productId={product_id}"
-    resp = session.get(url)
+
+class Session(requests.Session):
+    """requests.Session with a browser User-Agent and a default timeout."""
+
+    def __init__(self):
+        super().__init__()
+        self.headers["User-Agent"] = USER_AGENT
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        return super().request(method, url, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# Episode lookup
+# --------------------------------------------------------------------------
+
+@dataclass
+class Episode:
+    product_id: str
+    slug: str
+    filename: str
+    plus_only: bool
+
+    @property
+    def url(self) -> str:
+        return f"https://npo.nl/start/afspelen/{self.slug}"
+
+
+def api_get(session: Session, endpoint: str, **params):
+    resp = session.get(f"{API_BASE}/{endpoint}", params=params)
+    if resp.status_code == 404:
+        raise NpoError(f"Not found on NPO Start: {endpoint} {params}")
     if resp.status_code != 200:
-        raise ValueError(f"Failed to get player token (status={resp.status_code}).")
-
+        raise NpoError(f"NPO API {endpoint} failed (status={resp.status_code}).")
     data = resp.json()
-    if "jwt" not in data:
-        raise ValueError("JWT not found in player-token response.")
-    return data["jwt"]
+    if not isinstance(data, (dict, list)):
+        raise NpoError(f"Not found on NPO Start: {endpoint} {params}")
+    return data
 
-def get_stream_info(jwt: str, session: requests.Session) -> dict:
+
+def first_number(value) -> int | None:
+    match = re.search(r"\d+", str(value or ""))
+    return int(match.group()) if match else None
+
+
+def build_filename(program: dict) -> str:
+    """'Serie - S07E01 - Titel', falling back to the slug when data is missing."""
+    series = (program.get("series") or {}).get("title")
+    season = first_number((program.get("season") or {}).get("seasonKey"))
+    number = first_number(program.get("programKey"))
+    title = program.get("title") or ""
+
+    if series and season is not None and number is not None:
+        parts = [series, f"S{season:02d}E{number:02d}"]
+        if title and title != series:
+            parts.append(title)
+        name = " - ".join(parts)
+    else:
+        name = title if title and not series else program["slug"]
+
+    # Characters that are illegal in filenames or special to yt-dlp templates.
+    return re.sub(r'[/\\?%*:|"<>]', "#", name).strip()
+
+
+def to_episode(program: dict) -> Episode:
+    restrictions = program.get("restrictions") or []
+    plus_only = bool(restrictions) and not any(
+        r.get("subscriptionType") == "free" for r in restrictions
+    )
+    return Episode(
+        product_id=program["productId"],
+        slug=program["slug"],
+        filename=build_filename(program),
+        plus_only=plus_only,
+    )
+
+
+def get_season_episodes(session: Session, season: dict) -> list[Episode]:
+    programs = api_get(session, "programs-by-season", guid=season["guid"])
+    programs.sort(key=lambda p: first_number(p.get("programKey")) or 0)
+    return [to_episode(p) for p in programs]
+
+
+def resolve_episodes(session: Session, npo_url: str) -> list[Episode]:
     """
-    Calls the 'stream-link' endpoint with the JWT to retrieve stream info
-    (streamURL, drmToken, subtitles, etc.).
+    Turn an NPO Start URL into the list of episodes it refers to. Supported:
+      /start/afspelen/<episode>
+      /start/serie/<series>[/afleveringen]
+      /start/serie/<series>[/afleveringen]/<season>
+      /start/serie/<series>/<season>/<episode>[/afspelen]
     """
-    url = "https://prod.npoplayer.nl/stream-link"
-    headers = {
-        "Authorization": jwt,
-        "Content-Type": "application/json",
-        "Origin": "https://npo.nl",
-        "Referer": "https://npo.nl/",
-    }
+    parts = [p for p in urlparse(npo_url).path.split("/") if p]
+    if parts[:1] == ["start"]:
+        parts = parts[1:]
+    if parts and parts[-1] == "afspelen" and len(parts) > 1:
+        parts = parts[:-1]
 
-    # Adjust this body if you need a different streaming profile or DRM
-    payload = {
-        "profileName": "dash",
-        "drmType": "widevine",
-        "referrerUrl": "https://npo.nl/start/serie/",
-        "ster": {
-            "identifier": "npo-app-desktop",
-            "deviceType": 4,
-            "player": "web"
-        }
-    }
+    if len(parts) == 2 and parts[0] in ("afspelen", "video"):
+        return [to_episode(api_get(session, "program-detail", slug=parts[1]))]
 
-    resp = session.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        if resp.status_code == 402:
-            raise ValueError(f"Failed to download 'Plus' content (do you have a NPO Plus subscription?).")
-        else:
-            raise ValueError(f"Failed to get stream info (status={resp.status_code}).")
+    if len(parts) >= 2 and parts[0] == "serie":
+        series_slug = parts[1]
+        rest = [p for p in parts[2:] if p != "afleveringen"]
 
-    return resp.json()
+        if len(rest) >= 2:
+            return [to_episode(api_get(session, "program-detail", slug=rest[1]))]
+
+        seasons = api_get(session, "series-seasons", slug=series_slug)
+        if rest:
+            seasons = [s for s in seasons if s.get("slug") == rest[0]]
+            if not seasons:
+                raise NpoError(f"Season '{rest[0]}' not found for '{series_slug}'.")
+        seasons.sort(key=lambda s: first_number(s.get("seasonKey")) or 0)
+
+        episodes = []
+        for season in seasons:
+            episodes.extend(get_season_episodes(session, season))
+        return episodes
+
+    raise NpoError(f"Unsupported NPO Start URL: {npo_url}")
 
 
-def npo_login(session: requests.Session) -> requests.Session:
-    """
-    Logs in to NPO using the provided session.
-    """
+# --------------------------------------------------------------------------
+# Login and stream info
+# --------------------------------------------------------------------------
+
+def form_value(soup: BeautifulSoup, name: str) -> str:
+    field = soup.find("input", {"name": name})
+    if not field or field.get("value") is None:
+        raise NpoError(f"Login failed: field '{name}' missing from NPO response.")
+    return field.get("value")
+
+
+def npo_login(session: Session, mail: str, password: str) -> None:
+    """Logs the session in to NPO ID and NPO Start."""
     url = "https://id.npo.nl/account/login"
     resp = session.get(url)
-
     if resp.status_code != 200:
-        raise ValueError(f"Failed to get login page (status={resp.status_code}).")
+        raise NpoError(f"Failed to get login page (status={resp.status_code}).")
 
-    # Get __RequestVerificationToken input value
-    soup = BeautifulSoup(resp.text, "html.parser")
-    token_input = soup.find("input", {"name": "__RequestVerificationToken"})
-    if not token_input:
-        raise ValueError("Could not find __RequestVerificationToken input.")
-
-    token = token_input.get("value")
-
-    # Send login request
+    token = form_value(BeautifulSoup(resp.text, "html.parser"),
+                       "__RequestVerificationToken")
     login = session.post(url, data={
         "__RequestVerificationToken": token,
-        "EmailAddress": os.getenv("NPO_MAIL"),
-        "Password": os.getenv("NPO_PASS"),
+        "EmailAddress": mail,
+        "Password": password,
+    })
+    if login.status_code != 200:
+        raise NpoError(f"Login failed (status={login.status_code}).")
+    if "profiel.npo.nl/callback" not in login.text:
+        raise NpoError("Login failed. Please check your credentials.")
+
+    soup = BeautifulSoup(login.text, "html.parser")
+    session.post("https://profiel.npo.nl/callback", data={
+        name: form_value(soup, name)
+        for name in ("code", "scope", "state", "session_state", "iss")
     })
 
-    if login.status_code == 200:
-        if 'profiel.npo.nl/callback' not in login.text:
-            raise ValueError(f"Login failed. Please check your credentials.")
-        else:
-            soup = BeautifulSoup(login.text, "html.parser")
-            code_input = soup.find("input", {"name": "code"})
-            scope_input = soup.find("input", {"name": "scope"})
-            state_input = soup.find("input", {"name": "state"})
-            session_state_input = soup.find("input", {"name": "session_state"})
-            iss_input = soup.find("input", {"name": "iss"})
+    profile = session.get("https://profiel.npo.nl/dashboard")
+    if mail.lower() not in profile.text.lower():
+        raise NpoError("Login failed. Please check your credentials.")
 
-            # Send callback request
-            session.post('https://profiel.npo.nl/callback', data={
-                "code": code_input.get("value"),
-                "scope": scope_input.get("value"),
-                "state": state_input.get("value"),
-                "session_state": session_state_input.get("value"),
-                "iss": iss_input.get("value")
-            })
-    else:
-        raise ValueError(f"Incorrect status code: {login.status_code}")
-    
-    # Check if login was successful
-    profile = session.get('https://profiel.npo.nl/dashboard')
-    if os.getenv("NPO_MAIL") not in profile.text:
-        raise ValueError(f"Login failed. Please check your credentials.")
-
-    # Get CSRF token to signin the NPO ID in NPO Start
-    csrf = session.get('https://npo.nl/start/api/auth/csrf')
-    jsn = csrf.json()
-
-    # Signin the NPO ID in NPO Start
-    sign_npoid = session.post('https://npo.nl/start/api/auth/signin/npo-id', data={
-        'callbackUrl': 'https://npo.nl/start/',
-        'csrfToken': jsn["csrfToken"],
-        'json': 'true'
-    })
-    jsn = sign_npoid.json()
-
-    # Follow redirects to NPO Start for cookies
-    session.get(jsn["url"], allow_redirects=True)
+    # Sign the NPO ID in to NPO Start and follow the redirects for its cookies.
+    csrf = session.get("https://npo.nl/start/api/auth/csrf").json()
+    signin = session.post("https://npo.nl/start/api/auth/signin/npo-id", data={
+        "callbackUrl": "https://npo.nl/start/",
+        "csrfToken": csrf["csrfToken"],
+        "json": "true",
+    }).json()
+    session.get(signin["url"], allow_redirects=True)
 
     print("Successfully logged in to NPO.")
-    return session
 
 
-def parse_pssh_from_mpd(mpd_xml: str) -> str:
+def get_player_token(session: Session, product_id: str) -> str:
+    resp = session.get(f"{API_BASE}/player-token", params={"productId": product_id})
+    if resp.status_code != 200:
+        raise NpoError(f"Failed to get player token (status={resp.status_code}).")
+    jwt = resp.json().get("jwt")
+    if not jwt:
+        raise NpoError("JWT not found in player-token response.")
+    return jwt
+
+
+def get_stream(session: Session, episode: Episode) -> dict:
+    """Returns the 'stream' object (streamURL, drm, ...) for an episode."""
+    jwt = get_player_token(session, episode.product_id)
+    resp = session.post(
+        STREAM_LINK_URL,
+        headers={
+            "Authorization": jwt,
+            "Origin": "https://npo.nl",
+            "Referer": "https://npo.nl/",
+        },
+        json={
+            "profileName": "dash",
+            "drmType": "widevine",
+            "referrerUrl": episode.url,
+        },
+    )
+    if resp.status_code == 402:
+        raise NpoError("This is NPO Plus content; set NPO_MAIL and NPO_PASS "
+                       "of an account with a Plus subscription.")
+    if resp.status_code == 451:
+        raise NpoError("NPO does not allow this programme from your location.")
+    if resp.status_code != 200:
+        raise NpoError(f"Failed to get stream info (status={resp.status_code}).")
+
+    stream = resp.json().get("stream") or {}
+    if not stream.get("streamURL"):
+        raise NpoError("No stream URL in stream-link response.")
+    return stream
+
+
+# --------------------------------------------------------------------------
+# DRM
+# --------------------------------------------------------------------------
+
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_mpd(mpd_xml: str) -> tuple[str, dict[str, str]]:
     """
-    Parse the MPD XML and extract the pssh from:
-       mpdData["MPD"]["Period"]["AdaptationSet"][1]["ContentProtection"][3].pssh
-    This is a very specific path and assumes that the second AdaptationSet
-    and the 4th ContentProtection node contain the target PSSH element.
-    If not found, returns an empty string.
+    Returns (pssh, kids) from a DASH manifest. The PSSH is taken from the
+    ContentProtection element with the Widevine scheme id, wherever it sits.
+    kids maps 'video'/'audio' to the default_KID (hex, no dashes) of that track.
     """
-    soup = BeautifulSoup(mpd_xml, "xml")
-    periods = soup.find_all("Period")
-    if len(periods) < 1:
-        return ""
+    pssh = ""
+    kids: dict[str, str] = {}
+    root = ET.fromstring(mpd_xml)
 
-    adaptation_sets = periods[0].find_all("AdaptationSet")
-    if len(adaptation_sets) < 2:
-        return ""
+    for adaptation in root.iter():
+        if local_name(adaptation.tag) != "AdaptationSet":
+            continue
+        kind = (adaptation.get("contentType")
+                or (adaptation.get("mimeType") or "").split("/")[0])
+        for protection in adaptation.iter():
+            if local_name(protection.tag) != "ContentProtection":
+                continue
+            for attr, value in protection.attrib.items():
+                if local_name(attr) == "default_KID" and kind:
+                    kids.setdefault(kind, value.replace("-", "").lower())
+            if (protection.get("schemeIdUri") or "").lower() == WIDEVINE_SCHEME:
+                for child in protection:
+                    if local_name(child.tag) == "pssh" and child.text and not pssh:
+                        pssh = child.text.strip()
+    return pssh, kids
 
-    content_protections = adaptation_sets[1].find_all("ContentProtection")
-    if len(content_protections) < 4:
-        return ""
 
-    target_cp = content_protections[3]
-    pssh_elem = target_cp.find("cenc:pssh")
-
-    if pssh_elem and pssh_elem.text:
-        return pssh_elem.text.strip()
-
-    return ""
-
-def get_widevine_keys(
-    pssh: str,
-    x_custom_data: str,
-    license_url: str = "https://npo-drm-gateway.samgcloud.nepworldwide.nl/authentication",
-    build_info: str = "",
-    force: bool = False
-) -> dict:
+def get_widevine_keys(pssh: str, license_url: str, api_key: str,
+                      custom_data: str = "") -> list[str]:
     """
-    Performs a multi-step Widevine license acquisition via https://getwvkeys.cc:
-      1) POST (pssh + license_url + build_info + force) to getwvkeys.cc
-         - If 'x-cache' is present in response headers, the server returns a cached 'keys' array.
-         - Otherwise, we receive a 'challenge' (base64) and 'session_id'.
-      2) Decode the base64 'challenge' into bytes and POST those bytes to the license server.
-      3) Base64-encode the license server's binary response and POST it back to getwvkeys.cc (with the same 'session_id').
-      4) Receive final keys.
-
-    :param pssh: Base64-encoded PSSH string
-    :param x_custom_data: Some token or DRM auth data required by the license server
-    :param license_url: The actual Widevine license server endpoint
-    :param build_info: (Optional) Additional param used by getwvkeys.cc
-    :param force: (Optional) If True, forces re-fetching keys even if cached
-    :param verbose: (Optional) If True, prints extra logs
-    :return: dict with the final JSON response from getwvkeys.cc (including "keys")
+    Gets the content keys ('kid:key' strings) through getwvkeys.cc:
+      1) POST the pssh; a cached result returns the keys right away,
+         otherwise we get a license challenge and a session id.
+      2) POST the challenge to the license server.
+      3) POST the license back to getwvkeys.cc to receive the keys.
     """
-    api_url = "https://getwvkeys.cc/pywidevine"
+    api_headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+    license_headers = {"User-Agent": USER_AGENT}
+    if custom_data:
+        api_headers["x-custom-data"] = custom_data
+        license_headers["x-custom-data"] = custom_data
 
-    # Headers for the getwvkeys API
-    api_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/90.0.4430.85 Safari/537.36"
-        ),
-        "Content-Type": "application/json",
-        "X-API-Key": VWKEYS_API_KEY,
-        "x-custom-data": x_custom_data
-    }
+    payload = {"pssh": pssh, "license_url": license_url,
+               "buildInfo": "", "force": False}
 
-    # The initial payload to getwvkeys
-    payload = {
-        "pssh": pssh,
-        "license_url": license_url,
-        "buildInfo": build_info,
-        "force": force,
-    }
+    def keys_from(data: dict) -> list[str]:
+        keys = [k["key"] for k in data.get("keys") or [] if k.get("key")]
+        if not keys:
+            raise NpoError("getwvkeys.cc returned no keys.")
+        return keys
 
+    r1 = requests.post(GETWVKEYS_URL, headers=api_headers, json=payload,
+                       timeout=REQUEST_TIMEOUT)
+    if r1.status_code != 200:
+        raise NpoError(f"getwvkeys.cc error (status={r1.status_code}): "
+                       f"{r1.text[:200]}")
+    data = r1.json()
+    if "x-cache" in r1.headers:
+        return keys_from(data)
+    if "challenge" not in data or "session_id" not in data:
+        raise NpoError("Unexpected getwvkeys.cc response (no challenge).")
+
+    r2 = requests.post(license_url, headers=license_headers,
+                       data=base64.b64decode(data["challenge"]),
+                       timeout=REQUEST_TIMEOUT)
+    if r2.status_code != 200:
+        raise NpoError(f"License server error (status={r2.status_code}): "
+                       f"{r2.text[:200]}")
+
+    payload.update(session_id=data["session_id"],
+                   response=base64.b64encode(r2.content).decode())
+    r3 = requests.post(GETWVKEYS_URL, headers=api_headers, json=payload,
+                       timeout=REQUEST_TIMEOUT)
+    if r3.status_code != 200:
+        raise NpoError(f"getwvkeys.cc error on final step "
+                       f"(status={r3.status_code}): {r3.text[:200]}")
+    return keys_from(r3.json())
+
+
+def get_keys(session: Session, stream: dict, episode: Episode,
+             download_dir: Path, api_key: str) -> tuple[list[str], dict[str, str]]:
+    """Returns (keys, kids) for a stream; keys is empty when there is no DRM."""
+    mpd = session.get(stream["streamURL"])
+    if mpd.status_code != 200:
+        raise NpoError(f"Failed to get manifest (status={mpd.status_code}).")
+    pssh, kids = parse_mpd(mpd.text)
+    debug("PSSH:", pssh or "(none)")
+
+    drm = stream.get("drm") or {}
+    drm_token = stream.get("drmToken") or ""
+    if not pssh:
+        if drm or drm_token:
+            raise NpoError("Stream is DRM protected but no Widevine PSSH "
+                           "was found in the manifest.")
+        return [], kids
+
+    cache_file = download_dir / "keys" / f"{episode.filename}.json"
+    if cache_file.is_file():
+        cached = json.loads(cache_file.read_text())
+        if cached.get("pssh") == pssh and cached.get("keys"):
+            debug("Using cached keys from", cache_file)
+            return cached["keys"], kids
+
+    if not api_key:
+        raise NpoError("This video is DRM protected: set GETWVKEYS_API_KEY in "
+                       ".env (key from https://getwvkeys.cc/me).")
+
+    if drm.get("licenseUrl"):
+        keys = get_widevine_keys(pssh, drm["licenseUrl"], api_key)
+    elif drm_token:
+        keys = get_widevine_keys(pssh, LEGACY_LICENSE_URL, api_key, drm_token)
+    else:
+        keys = get_widevine_keys(pssh, DEFAULT_LICENSE_URL, api_key)
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps({"pssh": pssh, "keys": keys}))
+    return keys, kids
+
+
+def pick_key(keys: list[str], kid: str | None) -> str | None:
+    """Returns the bare key for a track, matching on KID when there are several."""
+    if not keys:
+        return None
+    for entry in keys:
+        entry_kid, _, key = entry.partition(":")
+        if kid and key and entry_kid.replace("-", "").lower() == kid:
+            return key
+    return keys[0].rpartition(":")[2]
+
+
+# --------------------------------------------------------------------------
+# Download
+# --------------------------------------------------------------------------
+
+def run(command: list[str]) -> None:
+    """Runs a command with live output and raises if it fails."""
+    debug("Running:", " ".join(command))
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        raise NpoError(f"{command[0]} failed (exit code {result.returncode}).")
+
+
+def track_kind(path: Path) -> str:
+    """'video' or 'audio', by asking ffprobe what the file contains."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    ).stdout
+    return "video" if "video" in out else "audio"
+
+
+def download(stream_url: str, filename: str, keys: list[str],
+             kids: dict[str, str], download_dir: Path) -> Path:
+    download_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{ENCRYPTED_PREFIX}{filename}."
+
+    args = ["yt-dlp", "--allow-unplayable-formats", "-f", "bv,ba",
+            "-P", str(download_dir),
+            "-o", f"{prefix}f%(format_id)s.%(ext)s"]
+    if shutil.which("aria2c"):
+        args += ["--downloader", "aria2c"]
+    run(args + [stream_url])
+
+    parts = sorted(
+        p for p in download_dir.iterdir()
+        if p.name.startswith(prefix)
+        and p.suffix not in (".part", ".ytdl", ".aria2")
+    )
+    if not parts:
+        raise NpoError("yt-dlp finished but no downloaded files were found.")
+
+    # Mux (and decrypt) into a temp file so a failed run never looks finished.
+    target = download_dir / f"{filename}.mkv"
+    temp = download_dir / f"{filename}.part.mkv"
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y"]
+    for part in parts:
+        key = pick_key(keys, kids.get(track_kind(part)))
+        if key:
+            args += ["-decryption_key", key]
+        args += ["-i", str(part)]
+    for index in range(len(parts)):
+        args += ["-map", str(index)]
     try:
-        # STEP 1: Call the getwvkeys API
-        r1 = requests.post(api_url, headers=api_headers, json=payload)
+        run(args + ["-c", "copy", str(temp)])
+    except NpoError:
+        temp.unlink(missing_ok=True)
+        raise
+    temp.replace(target)
 
-        if r1.status_code != 200 and r1.status_code != 302:
-            print("[get_widevine_keys] Error from getwvkeys.cc:", r1.status_code, r1.text)
-            return {}
+    for part in parts:
+        part.unlink()
+    return target
 
-        # Attempt to parse JSON
-        data1 = r1.json()
 
-        # If x-cache is in response headers, we have a cached result with keys
-        if "x-cache" in r1.headers:
-            # The server returns a direct "keys" array
-            return data1
+def process_episode(session: Session, episode: Episode, args,
+                    download_dir: Path, api_key: str) -> str:
+    """Handles one episode; returns 'done' or 'skipped'."""
+    target = download_dir / f"{episode.filename}.mkv"
+    if not args.keys_only and target.is_file():
+        print("  Already downloaded, skipping.")
+        return "skipped"
 
-        # Not cached => we have to do the challenge/response
-        if "challenge" not in data1 or "session_id" not in data1:
-            print("[get_widevine_keys] Unexpected response (no challenge/session_id).")
-            return {}
+    stream = get_stream(session, episode)
+    debug("Stream URL:", stream["streamURL"])
+    keys, kids = get_keys(session, stream, episode, download_dir, api_key)
 
-        challenge_b64 = data1["challenge"]
-        session_id = data1["session_id"]
+    if args.keys_only:
+        for key in keys:
+            print(f"  {key}")
+        if not keys:
+            print("  No DRM.")
+        return "done"
 
-        # STEP 2: decode the base64 challenge into raw bytes
-        challenge_bytes = base64.b64decode(challenge_b64)
+    debug("Keys:", keys)
+    path = download(stream["streamURL"], episode.filename, keys, kids,
+                    download_dir)
+    print(f"  Saved {path}")
+    return "done"
 
-        # We now POST these bytes to the real license server
-        # Make sure we pass the same 'x_custom_data' if it is required by that server.
-        # Typically, you also want no JSON content-type here, because it's a binary POST.
-        license_headers = {
-            "User-Agent": api_headers["User-Agent"],
-            "x-custom-data": x_custom_data,
-        }
 
-        r2 = requests.post(license_url, headers=license_headers, data=challenge_bytes)
+def main() -> int:
+    global VERBOSE
 
-        if r2.status_code != 200:
-            print("[get_widevine_keys] License server error:", r2.status_code, r2.text)
-            return {}
+    parser = argparse.ArgumentParser(
+        description="Download an episode, season or series from NPO Start.")
+    parser.add_argument("url", help="NPO Start URL of an episode, season or series")
+    parser.add_argument("-o", "--output", help="download directory "
+                        "(default: DOWNLOAD_DIR from .env, or 'npovideos')")
+    parser.add_argument("-k", "--keys-only", action="store_true",
+                        help="only print the DRM keys, do not download")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print stream URLs, PSSH, keys and commands")
+    args = parser.parse_args()
+    VERBOSE = args.verbose
 
-        # STEP 3: Base64-encode the license server's binary response
-        license_b64 = base64.b64encode(r2.content).decode('utf-8')
+    download_dir = Path(args.output or env("DOWNLOAD_DIR") or "npovideos")
+    # VWKEYS_API_KEY is the name older versions of this script used.
+    api_key = env("GETWVKEYS_API_KEY") or env("VWKEYS_API_KEY")
 
-        # Prepare second call to getwvkeys with session_id + license response
-        payload2 = {
-            "pssh": pssh,
-            "license_url": license_url,
-            "buildInfo": build_info,
-            "force": force,
-            "session_id": session_id,
-            "response": license_b64
-        }
+    if not args.keys_only:
+        missing = [t for t in ("yt-dlp", "ffmpeg", "ffprobe") if not shutil.which(t)]
+        if missing:
+            print(f"Error: {', '.join(missing)} not found; please install.")
+            return 1
 
-        r3 = requests.post(api_url, headers=api_headers, json=payload2)
-
-        if r3.status_code != 200:
-            print("[get_widevine_keys] Error from getwvkeys.cc on final step:", r3.status_code, r3.text)
-            return {}
-
-        data3 = r3.json()
-        return data3
-
-    except Exception as e:
-        print("[get_widevine_keys] Exception:", str(e))
-        return {}
-
-def get_npo_stream_info(npo_url: str) -> dict:
-    """
-    Orchestrates the entire process:
-    1. Parse the slug (e.g. "spoorloos_107") from the URL.
-    2. GET the page HTML.
-    3. Extract the matching productId for that slug.
-    4. GET the JWT token from /player-token.
-    5. POST to /stream-link with the JWT to get final stream info.
-    6. If drmToken is present, fetch the MPD and parse the PSSH.
-    7. If both pssh and drmToken are available, call getwvkeys.cc to get Widevine keys.
-
-    Returns a dict with all relevant data:
-      - slug
-      - productId
-      - streamURL
-      - drmType
-      - drmToken
-      - pssh (if found)
-      - wideVineKeyResponse (if retrieved)
-      - fullResponse (raw JSON from stream-link)
-    """
-
-    slug = get_slug_from_url(npo_url)
-
-    with requests.Session() as s:
-        # 1. GET the page
-        resp = s.get(npo_url)
-        if resp.status_code != 200:
-            raise ValueError(f"Could not retrieve the page (status={resp.status_code}).")
-
-        # 2. Extract productId matching the slug
-        product_id = get_product_id_from_html(resp.text, slug)
-
+    failed = 0
+    with Session() as session:
         try:
-            s = npo_login(s)
-        except Exception as e:
-            print(f"Failed to login to NPO: {e}")
-        
-        # 3. Get JWT
-        jwt_token = get_player_token(product_id, s)
+            episodes = resolve_episodes(session, args.url)
+            if not episodes:
+                raise NpoError("No episodes found for this URL.")
+            print(f"Found {len(episodes)} episode(s).")
 
-        # 4. Get final stream info
-        stream_info = get_stream_info(jwt_token, s)
-        stream_data = stream_info.get("stream", {})
+            mail, password = env("NPO_MAIL"), env("NPO_PASS")
+            logged_in = False
+            if mail and password:
+                try:
+                    npo_login(session, mail, password)
+                    logged_in = True
+                except (NpoError, requests.RequestException, KeyError,
+                        ValueError) as e:
+                    print(f"Warning: continuing without login: {e}")
+            if not logged_in:
+                # Anonymous sessions need the next-auth cookies as well.
+                session.get("https://npo.nl/start/api/auth/session")
+        except (NpoError, requests.RequestException) as e:
+            print("Error:", e)
+            return 1
 
-        drm_token = stream_data.get("drmToken")
-        pssh = ""
-        widevine_key_response = None
+        for number, episode in enumerate(episodes, 1):
+            print(f"[{number}/{len(episodes)}] {episode.filename}")
+            if episode.plus_only and not logged_in:
+                print("  NPO Plus only and not logged in, skipping.")
+                failed += 1
+                continue
+            try:
+                process_episode(session, episode, args, download_dir, api_key)
+            except (NpoError, requests.RequestException) as e:
+                print("  Error:", e)
+                failed += 1
 
-        # 5. If a DRM token is present, retrieve the MPD and parse the PSSH.
-        if drm_token:
-            mpd_url = stream_data.get("streamURL")
-            if mpd_url:
-                mpd_resp = s.get(mpd_url)
-                if mpd_resp.status_code == 200:
-                    pssh = parse_pssh_from_mpd(mpd_resp.text)
-                else:
-                    pssh = ""
+    if failed:
+        print(f"{failed} of {len(episodes)} episode(s) failed.")
+    return 1 if failed else 0
 
-            # 6. If we have both pssh and drmToken, call getwvkeys.cc
-            if pssh and drm_token:
-                widevine_key_response = get_widevine_keys(pssh, drm_token)
-
-        # Generate file name with seriename/SxxExx
-        parsed = urlparse(npo_url).path.split("/")
-        filename = f"{parsed[3]}-{parsed[4]}-{parsed[5]}"
-
-        return {
-            "filename": filename,
-            "slug": slug,
-            "productId": product_id,
-            "streamURL": stream_data.get("streamURL"),
-            "drmType": stream_data.get("drmType"),
-            "drmToken": drm_token,
-            "pssh": pssh,
-            "wideVineKeyResponse": widevine_key_response,
-            "fullResponse": stream_info
-        }
-    
-def download_from_info(info: dict):
-    """
-    Downloads the stream from the given info dict.
-    """
-    # Check if file is not already downloaded
-    if os.path.isfile(DOWNLOAD_DIR + "/" + info["filename"] + ".mkv"):
-        print(f"Video already exists.")
-        return
-    
-    # Download mpd using yt-dlp
-    mpd_url = info["streamURL"]
-    filename_format = 'encrypted#' + info["filename"] + '.%(ext)s'
-    args = [
-        '--allow-u',
-        '--downloader',
-        'aria2c',
-        '-f',
-        'bv,ba',
-        '-P',
-        DOWNLOAD_DIR + '/',
-        '-o',
-        filename_format,
-        mpd_url
-    ];
-    runned = run_command('yt-dlp', args)
-    print(runned)
-
-    # Decrypt the video
-    key = None
-    if info["wideVineKeyResponse"] not in [None, {}]:
-        key = info["wideVineKeyResponse"]["keys"][0]["key"]
-    
-    return decrypt_files(filename_format, key)
-
-
-def decrypt_files(filename_format, key):
-    """
-    Decrypts the downloaded encrypted file.
-    """
-    file_path = DOWNLOAD_DIR + "/" + filename_format
-    mp4_file = file_path.replace('.%(ext)s', '.mp4')
-    m4a_file = file_path.replace('.%(ext)s', '.m4a')
-
-    # Combine video and audio
-    combined_file = file_path.replace('.%(ext)s', '.mkv').replace('encrypted#', '')
-    args = ['-i',mp4_file,'-i',m4a_file,'-c','copy',combined_file]
-    if key:
-        key_part = key.split(':')[1]
-        args = [
-            '-decryption_key',
-            key_part,
-            '-i',
-            mp4_file,
-            '-decryption_key',
-            key_part,
-            '-i',
-            m4a_file,
-            '-c',
-            'copy',
-            combined_file
-        ]
-    runned = run_command('ffmpeg', args)
-    print(runned)
-
-    # Remove the decrypted files
-    os.remove(mp4_file)
-    os.remove(m4a_file)
-
-    return combined_file
-        
-
-def run_command(command, args):
-    """
-    Run a command with arguments and return the output.
-    """
-    import subprocess
-    process = subprocess.Popen([command] + args, stdout=subprocess.PIPE)
-    output, error = process.communicate()
-    return output
-    
-
-def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <npo-url>")
-        sys.exit(1)
-
-    npo_url = sys.argv[1]
-
-    try:
-        info = get_npo_stream_info(npo_url)
-        print("=== NPO Stream Info ===")
-        print(f"Filename:              {info['filename']}")
-        print(f"Slug:                  {info['slug']}")
-        print(f"ProductId:             {info['productId']}")
-        print(f"Stream URL:            {info['streamURL']}")
-        print(f"DRM Type:              {info['drmType']}")
-        print(f"DRM Token:             {info['drmToken']}")
-        print(f"PSSH:                  {info['pssh']}")
-        print(f"WideVineKeyResponse:   {info['wideVineKeyResponse']}")
-        # Or dump everything:
-        # print(json.dumps(info["fullResponse"], indent=2))
-        download_from_info(info)
-    except Exception as e:
-        print("Error:", e)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
